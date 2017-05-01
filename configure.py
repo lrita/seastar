@@ -199,6 +199,7 @@ tests = [
     'tests/udp_zero_copy',
     'tests/shared_ptr_test',
     'tests/weak_ptr_test',
+    'tests/checked_ptr_test',
     'tests/slab_test',
     'tests/fstream_test',
     'tests/distributed_test',
@@ -212,7 +213,6 @@ tests = [
     'tests/connect_test',
     'tests/chunked_fifo_test',
     'tests/circular_buffer_test',
-    'tests/scollectd_test',
     'tests/perf/perf_fstream',
     'tests/json_formatter_test',
     'tests/dns_test',
@@ -438,6 +438,7 @@ deps = {
     'tests/udp_zero_copy': ['tests/udp_zero_copy.cc'] + core + libnet,
     'tests/shared_ptr_test': ['tests/shared_ptr_test.cc'] + core,
     'tests/weak_ptr_test': ['tests/weak_ptr_test.cc'] + core,
+    'tests/checked_ptr_test': ['tests/checked_ptr_test.cc'] + core,
     'tests/slab_test': ['tests/slab_test.cc'] + core,
     'tests/fstream_test': ['tests/fstream_test.cc'] + core,
     'tests/distributed_test': ['tests/distributed_test.cc'] + core,
@@ -447,7 +448,6 @@ deps = {
     'tests/connect_test': ['tests/connect_test.cc'] + core + libnet,
     'tests/chunked_fifo_test': ['tests/chunked_fifo_test.cc'] + core,
     'tests/circular_buffer_test': ['tests/circular_buffer_test.cc'] + core,
-    'tests/scollectd_test': ['tests/scollectd_test.cc'] + core,
     'tests/perf/perf_fstream': ['tests/perf/perf_fstream.cc'] + core,
     'tests/json_formatter_test': ['tests/json_formatter_test.cc'] + core + http,
     'tests/dns_test': ['tests/dns_test.cc'] + core + libnet,
@@ -470,7 +470,6 @@ boost_tests = [
     'tests/fstream_test',
     'tests/rpc_test',
     'tests/connect_test',
-    'tests/scollectd_test',
     'tests/json_formatter_test',
     'tests/dns_test',
     'tests/execution_stage_test',
@@ -702,7 +701,7 @@ with open(buildfile, 'w') as f:
         builddir = {outdir}
         cxx = {cxx}
         # we disable _FORTIFY_SOURCE because it generates false positives with longjmp() (core/thread.cc)
-        cxxflags = -std=gnu++1y {dbgflag} {fpie} -Wall -Werror -Wno-error-deprecated -fvisibility=hidden -pthread -I. -U_FORTIFY_SOURCE {user_cflags} {warnings} {defines}
+        cxxflags = -std=gnu++1y {dbgflag} {fpie} -Wall -Werror -Wno-error=deprecated-declarations -fvisibility=hidden -pthread -I. -U_FORTIFY_SOURCE {user_cflags} {warnings} {defines}
         ldflags = {dbgflag} -Wl,--no-as-needed {static} {pie} -fvisibility=hidden -pthread {user_ldflags}
         libs = {libs}
         pool link_pool

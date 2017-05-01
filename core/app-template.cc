@@ -32,15 +32,16 @@
 
 namespace bpo = boost::program_options;
 
-app_template::app_template()
-        : _opts("App options") {
-    _opts.add_options()
-            ("help,h", "show help message")
-            ;
-    _opts.add(reactor::get_options_description());
-    _opts.add(seastar::metrics::get_options_description());
-    _opts.add(smp::get_options_description());
-    _opts.add(scollectd::get_options_description());
+app_template::app_template(app_template::config cfg)
+    : _cfg(std::move(cfg))
+    , _opts(_cfg.name + " options") {
+        _opts.add_options()
+                ("help,h", "show help message")
+                ;
+        _opts.add(reactor::get_options_description());
+        _opts.add(seastar::metrics::get_options_description());
+        _opts.add(smp::get_options_description());
+        _opts.add(scollectd::get_options_description());
 }
 
 boost::program_options::options_description_easy_init
@@ -111,11 +112,12 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
         print("error: %s\n\nTry --help.\n", e.what());
         return 2;
     }
-    bpo::notify(configuration);
     if (configuration.count("help")) {
         std::cout << _opts << "\n";
         return 1;
     }
+
+    bpo::notify(configuration);
     configuration.emplace("argv0", boost::program_options::variable_value(std::string(av[0]), false));
     smp::configure(configuration);
     _configuration = {std::move(configuration)};
