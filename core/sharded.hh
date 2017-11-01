@@ -29,6 +29,9 @@
 
 namespace seastar {
 
+template <typename T>
+class sharded;
+
 /// if sharded service inherits from this class sharded::stop() will wait
 /// untill all references to a service on each shard will dissapper before
 /// returning. It is still service's own responcibility to track its references
@@ -45,6 +48,28 @@ protected:
     }
     template <typename Service> friend class sharded;
 };
+
+
+/// \brief Provide a sharded service with access to its peers
+///
+/// If a service class inherits from this, it will gain a \code container()
+/// method that provides access to the \ref sharded object, with which it
+/// can call its peers.
+template <typename Service>
+class peering_sharded_service {
+    sharded<Service>* _container = nullptr;
+private:
+    template <typename T> friend class sharded;
+    void set_container(sharded<Service>* container) { _container = container; }
+public:
+    peering_sharded_service() = default;
+    peering_sharded_service(peering_sharded_service<Service>&&) = default;
+    peering_sharded_service(const peering_sharded_service<Service>&) = delete;
+    peering_sharded_service& operator=(const peering_sharded_service<Service>&) = delete;
+    sharded<Service>& container() { return *_container; }
+    const sharded<Service>& container() const { return *_container; }
+};
+
 
 /// Exception thrown when a \ref sharded object does not exist
 class no_sharded_instance_exception : public std::exception {
@@ -79,7 +104,7 @@ public:
 template <typename Service>
 class sharded {
     struct entry {
-        ::shared_ptr<Service> service;
+        shared_ptr<Service> service;
         promise<> freed;
     };
     std::vector<entry> _instances;
@@ -90,13 +115,23 @@ private:
     template <typename U, bool async>
     friend struct shared_ptr_make_helper;
 
+    template <typename T>
+    std::enable_if_t<std::is_base_of<peering_sharded_service<T>, T>::value>
+    set_container(T& service) {
+        service.set_container(this);
+    }
+
+    template <typename T>
+    std::enable_if_t<!std::is_base_of<peering_sharded_service<T>, T>::value>
+    set_container(T& service) {
+    }
 public:
     /// Constructs an empty \c sharded object.  No instances of the service are
     /// created.
     sharded() {}
     sharded(const sharded& other) = delete;
     /// Moves a \c sharded object.
-    sharded(sharded&& other) = default;
+    sharded(sharded&& other) noexcept;
     sharded& operator=(const sharded& other) = delete;
     /// Moves a \c sharded object.
     sharded& operator=(sharded&& other) = default;
@@ -163,7 +198,7 @@ public:
     map_reduce(Reducer&& r, Ret (Service::*func)(FuncArgs...), Args&&... args)
         -> typename reducer_traits<Reducer>::future_type
     {
-        return ::map_reduce(boost::make_counting_iterator<unsigned>(0),
+        return ::seastar::map_reduce(boost::make_counting_iterator<unsigned>(0),
                             boost::make_counting_iterator<unsigned>(_instances.size()),
             [this, func, args = std::make_tuple(std::forward<Args>(args)...)] (unsigned c) mutable {
                 return smp::submit_to(c, [this, func, args] () mutable {
@@ -187,7 +222,7 @@ public:
     inline
     auto map_reduce(Reducer&& r, Func&& func) -> typename reducer_traits<Reducer>::future_type
     {
-        return ::map_reduce(boost::make_counting_iterator<unsigned>(0),
+        return ::seastar::map_reduce(boost::make_counting_iterator<unsigned>(0),
                             boost::make_counting_iterator<unsigned>(_instances.size()),
             [this, &func] (unsigned c) mutable {
                 return smp::submit_to(c, [this, func] () mutable {
@@ -223,7 +258,7 @@ public:
                 return map(*inst);
             });
         };
-        return ::map_reduce(smp::all_cpus().begin(), smp::all_cpus().end(),
+        return ::seastar::map_reduce(smp::all_cpus().begin(), smp::all_cpus().end(),
                             std::move(wrapped_map),
                             std::move(initial),
                             std::move(reduce));
@@ -297,18 +332,19 @@ public:
     bool local_is_initialized();
 
 private:
-    void track_deletion(::shared_ptr<Service>& s, std::false_type) {
+    void track_deletion(shared_ptr<Service>& s, std::false_type) {
         // do not wait for instance to be deleted since it is not going to notify us
         service_deleted();
     }
 
-    void track_deletion(::shared_ptr<Service>& s, std::true_type) {
+    void track_deletion(shared_ptr<Service>& s, std::true_type) {
         s->_delete_cb = std::bind(std::mem_fn(&sharded<Service>::service_deleted), this);
     }
 
     template <typename... Args>
     shared_ptr<Service> create_local_service(Args&&... args) {
-        auto s = ::make_shared<Service>(std::forward<Args>(args)...);
+        auto s = ::seastar::make_shared<Service>(std::forward<Args>(args)...);
+        set_container(*s);
         track_deletion(s, std::is_base_of<async_sharded_service<Service>, Service>());
         return s;
     }
@@ -327,6 +363,39 @@ sharded<Service>::~sharded() {
 	assert(_instances.empty());
 }
 
+namespace internal {
+
+template <typename Service>
+class either_sharded_or_local {
+    sharded<Service>& _sharded;
+public:
+    either_sharded_or_local(sharded<Service>& s) : _sharded(s) {}
+    operator sharded<Service>& () { return _sharded; }
+    operator Service& () { return _sharded.local(); }
+};
+
+template <typename T>
+inline
+T&&
+unwrap_sharded_arg(T&& arg) {
+    return std::forward<T>(arg);
+}
+
+template <typename Service>
+either_sharded_or_local<Service>
+unwrap_sharded_arg(std::reference_wrapper<sharded<Service>> arg) {
+    return either_sharded_or_local<Service>(arg);
+}
+
+}
+
+template <typename Service>
+sharded<Service>::sharded(sharded&& x) noexcept : _instances(std::move(x._instances)) {
+    for (auto&& e : _instances) {
+        set_container(e);
+    }
+}
+
 template <typename Service>
 template <typename... Args>
 future<>
@@ -336,7 +405,7 @@ sharded<Service>::start(Args&&... args) {
         [this, args = std::make_tuple(std::forward<Args>(args)...)] (unsigned c) mutable {
             return smp::submit_to(c, [this, args] () mutable {
                 _instances[engine().cpu_id()].service = apply([this] (Args... args) {
-                    return create_local_service(std::forward<Args>(args)...);
+                    return create_local_service(internal::unwrap_sharded_arg(std::forward<Args>(args))...);
                 }, args);
             });
     }).then_wrapped([this] (future<> f) {
@@ -359,7 +428,7 @@ sharded<Service>::start_single(Args&&... args) {
     _instances.resize(1);
     return smp::submit_to(0, [this, args = std::make_tuple(std::forward<Args>(args)...)] () mutable {
         _instances[0].service = apply([this] (Args... args) {
-            return create_local_service(std::forward<Args>(args)...);
+            return create_local_service(internal::unwrap_sharded_arg(std::forward<Args>(args))...);
         }, args);
     }).then_wrapped([this] (future<> f) {
         try {
@@ -452,8 +521,6 @@ inline bool sharded<Service>::local_is_initialized() {
            _instances[engine().cpu_id()].service;
 }
 
-}
-
 /// Smart pointer wrapper which makes it safe to move across CPUs.
 ///
 /// \c foreign_ptr<> is a smart pointer wrapper which, unlike
@@ -540,7 +607,9 @@ foreign_ptr<T> make_foreign(T ptr) {
 }
 
 template<typename T>
-struct is_smart_ptr<::foreign_ptr<T>> : std::true_type {};
+struct is_smart_ptr<foreign_ptr<T>> : std::true_type {};
+
+}
 
 /// @}
 

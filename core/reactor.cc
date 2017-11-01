@@ -52,6 +52,9 @@
 #include <boost/algorithm/string/split.hpp>
 #include <boost/iterator/counting_iterator.hpp>
 #include <boost/range/numeric.hpp>
+#include <boost/range/algorithm/sort.hpp>
+#include <boost/range/algorithm/remove_if.hpp>
+#include <boost/algorithm/clamp.hpp>
 #include <boost/range/adaptor/transformed.hpp>
 #include <boost/version.hpp>
 #include <atomic>
@@ -89,21 +92,40 @@
 #include <osv/newpoll.hh>
 #endif
 
+#if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
+#endif
+
 #include "util/defer.hh"
 #include "core/metrics.hh"
 #include "execution_stage.hh"
+#include "exception_hacks.hh"
+
+namespace seastar {
 
 using namespace std::chrono_literals;
 
 using namespace net;
-using namespace seastar;
 
 seastar::logger seastar_logger("seastar");
+seastar::logger sched_logger("scheduler");
 
-std::atomic<lowres_clock::rep> lowres_clock::_now;
+std::atomic<lowres_clock_impl::steady_rep> lowres_clock_impl::counters::_steady_now;
+std::atomic<lowres_clock_impl::system_rep> lowres_clock_impl::counters::_system_now;
 std::atomic<manual_clock::rep> manual_clock::_now;
-constexpr std::chrono::milliseconds lowres_clock::_granularity;
+constexpr std::chrono::milliseconds lowres_clock_impl::_granularity;
+
+static bool sched_debug() {
+    return false;
+}
+
+template <typename... Args>
+void
+sched_print(const char* fmt, Args&&... args) {
+    if (sched_debug()) {
+        sched_logger.trace(fmt, std::forward<Args>(args)...);
+    }
+}
 
 timespec to_timespec(steady_clock_type::time_point t) {
     using ns = std::chrono::nanoseconds;
@@ -111,17 +133,21 @@ timespec to_timespec(steady_clock_type::time_point t) {
     return { n / 1'000'000'000, n % 1'000'000'000 };
 }
 
-lowres_clock::lowres_clock() {
+lowres_clock_impl::lowres_clock_impl() {
     update();
-    _timer.set_callback(&lowres_clock::update);
+    _timer.set_callback(&lowres_clock_impl::update);
     _timer.arm_periodic(_granularity);
 }
 
-void lowres_clock::update() {
-    using namespace std::chrono;
-    auto now = steady_clock_type::now();
-    auto ticks = duration_cast<milliseconds>(now.time_since_epoch()).count();
-    _now.store(ticks, std::memory_order_relaxed);
+void lowres_clock_impl::update() {
+    auto const steady_count =
+            std::chrono::duration_cast<steady_duration>(base_steady_clock::now().time_since_epoch()).count();
+
+    auto const system_count =
+            std::chrono::duration_cast<system_duration>(base_system_clock::now().time_since_epoch()).count();
+
+    counters::_steady_now.store(steady_count, std::memory_order_relaxed);
+    counters::_system_now.store(system_count, std::memory_order_relaxed);
 }
 
 template <typename T>
@@ -224,6 +250,7 @@ bool reactor::signals::pure_poll_signal() const {
 }
 
 void reactor::signals::action(int signo, siginfo_t* siginfo, void* ignore) {
+    g_need_preempt = true;
     engine()._signals._pending_signals.fetch_or(1ull << signo, std::memory_order_relaxed);
 }
 
@@ -264,9 +291,15 @@ public:
     }
 
     void append_backtrace() noexcept {
-        backtrace([this] (uintptr_t addr) {
-            append("  0x");
-            append_hex(addr - 1);
+        backtrace([this] (frame f) {
+            append("  ");
+            if (!f.so->name.empty()) {
+                append(f.so->name.c_str(), f.so->name.size());
+                append("+");
+            }
+
+            append("0x");
+            append_hex(f.addr);
             append("\n");
         });
     }
@@ -323,6 +356,62 @@ static decltype(auto) install_signal_handler_stack() {
     });
 }
 
+reactor::task_queue::task_queue(unsigned id, sstring name, float shares)
+        : _shares(std::max(shares, 1.0f))
+        , _reciprocal_shares_times_2_power_32((uint64_t(1) << 32) / _shares)
+        , _id(id)
+        , _name(name) {
+    namespace sm = seastar::metrics;
+    static auto group = sm::label("group");
+    auto group_label = group(_name);
+    _metrics.add_group("scheduler", {
+        sm::make_counter("runtime_ms", [this] {
+            return std::chrono::duration_cast<std::chrono::milliseconds>(_runtime).count();
+        }, sm::description("Accumulated runtime of this task queue; an increment rate of 1000ms per second indicates full utilization"),
+            {group_label}),
+        sm::make_counter("tasks_processed", _tasks_processed,
+                sm::description("Count of tasks executing on this queue; indicates together with runtime_ms indicates length of tasks"),
+                {group_label}),
+        sm::make_gauge("queue_length", [this] { return _q.size(); },
+                sm::description("Size of backlog on this queue, in tasks; indicates whether the queue is busy and/or contended"),
+                {group_label}),
+        sm::make_gauge("shares", [this] { return _shares; },
+                sm::description("Shares allocated to this queue"),
+                {group_label}),
+    });
+}
+
+inline
+int64_t
+reactor::task_queue::to_vruntime(sched_clock::duration runtime) const {
+    auto scaled = (runtime.count() * _reciprocal_shares_times_2_power_32) >> 32;
+    // Prevent overflow from returning ridiculous values
+    return std::max<int64_t>(scaled, 0);
+}
+
+void
+reactor::task_queue::set_shares(float shares) {
+    _shares = std::max(shares, 1.0f);
+    _reciprocal_shares_times_2_power_32 = (uint64_t(1) << 32) / _shares;
+}
+
+void
+reactor::account_runtime(task_queue& tq, sched_clock::duration runtime) {
+    tq._vruntime += tq.to_vruntime(runtime);
+    tq._runtime += runtime;
+}
+
+void
+reactor::account_idle(sched_clock::duration runtime) {
+    // anything to do here?
+}
+
+struct reactor::task_queue::indirect_compare {
+    bool operator()(const task_queue* tq1, const task_queue* tq2) const {
+        return tq1->_vruntime < tq2->_vruntime;
+    }
+};
+
 reactor::reactor(unsigned id)
     : _backend()
     , _id(id)
@@ -338,7 +427,9 @@ reactor::reactor(unsigned id)
     , _reuseport(posix_reuseport_detect())
     , _task_quota_timer_thread(&reactor::task_quota_timer_thread_fn, this)
     , _thread_pool(seastar::format("syscall-{}", id)) {
-
+    _task_queues.push_back(std::make_unique<task_queue>(0, "main", 1000));
+    _task_queues.push_back(std::make_unique<task_queue>(1, "atexit", 1000));
+    _at_destroy_tasks = _task_queues.back().get();
     seastar::thread_impl::init();
     auto r = ::io_setup(max_aio, &_io_context);
     assert(r >= 0);
@@ -362,7 +453,7 @@ reactor::reactor(unsigned id)
     assert(r == 0);
 #endif
     memory::set_reclaim_hook([this] (std::function<void ()> reclaim_fn) {
-        add_high_priority_task(make_task([fn = std::move(reclaim_fn)] {
+        add_high_priority_task(make_task(default_scheduling_group(), [fn = std::move(reclaim_fn)] {
             fn();
         }));
     });
@@ -387,15 +478,22 @@ reactor::~reactor() {
     eraser(_expired_timers);
     eraser(_expired_lowres_timers);
     eraser(_expired_manual_timers);
+    ::io_destroy(_io_context);
+}
+
+// Add to an atomic integral non-atomically and returns the previous value
+template <typename Integral>
+inline Integral add_nonatomically(std::atomic<Integral>& value, Integral inc) {
+    auto tmp = value.load(std::memory_order_relaxed);
+    value.store(tmp + inc, std::memory_order_relaxed);
+    return tmp;
 }
 
 // Increments an atomic integral non-atomically and returns the previous value
 // Akin to value++;
 template <typename Integral>
 inline Integral increment_nonatomically(std::atomic<Integral>& value) {
-    auto tmp = value.load(std::memory_order_relaxed);
-    value.store(tmp + 1, std::memory_order_relaxed);
-    return tmp;
+    return add_nonatomically(value, Integral(1));
 }
 
 void
@@ -420,13 +518,17 @@ reactor::task_quota_timer_thread_fn() {
                 pthread_kill(who, sig);
             }
         }
-        // We use a tick at every timer firing so we can report supressed backtraces.
+        // We use a tick at every timer firing so we can report suppressed backtraces.
         // Best case it's a correctly predicted branch. If a backtrace had happened in
         // the near past it's an increment and two branches.
         //
-        // We can do it a cheaper if we don't report supressed backtraces.
-        void tick() {
-            if (_reported && (_ticks++ >= _ticks_per_minute)) {
+        // We can do it a cheaper if we don't report suppressed backtraces.
+        void tick(unsigned ticks = 1) {
+            if (!_reported) {
+                return;
+            }
+            _ticks += ticks;
+            if (_ticks >= _ticks_per_minute) {
                 if (_reported > _max_reports_per_minute) {
                     auto supressed = _reported - _max_reports_per_minute;
                     backtrace_buffer buf;
@@ -458,14 +560,18 @@ reactor::task_quota_timer_thread_fn() {
         _task_quota_timer.read(&events, 8);
         _local_need_preempt = true;
     }
-    block_notifier_rate_limiter rate_limit(unsigned(60s / _task_quota), 5, _id);
+    block_notifier_rate_limiter rate_limit(unsigned(60s / _task_quota), _stall_detector_reports_per_minute, _id);
+    uint64_t saved_missed_ticks = 0;
 
     while (!_dying.load(std::memory_order_relaxed)) {
         uint64_t events;
         _task_quota_timer.read(&events, 8);
         _local_need_preempt = true;
 
-        rate_limit.tick();
+        auto missed_ticks = _stall_detector_missed_ticks.load(std::memory_order_relaxed);
+        rate_limit.tick(std::max(uint64_t(1), missed_ticks - saved_missed_ticks));
+        saved_missed_ticks = missed_ticks;
+
         auto tp = _tasks_processed.load(std::memory_order_relaxed);
         auto p = _polls.load(std::memory_order_relaxed);
         if ((tp == last_tasks_processed_seen) && (p == last_polls_seen)) {
@@ -534,7 +640,7 @@ void reactor::timer_thread_func() {
                 if (tmr.expired()) {
                     _timer_due = 0;
                     _engine_thread->unsafe_stop();
-                    _pending_tasks.push_front(make_task([this] {
+                    _pending_tasks.push_front(make_task(default_scheduling_group(), [this] {
                         complete_timers(_timers, _expired_timers, [this] {
                             if (!_timers.empty()) {
                                 enable_timer(_timers.get_next_timeout());
@@ -596,10 +702,12 @@ void reactor::configure(boost::program_options::variables_map vm) {
     });
 
     _handle_sigint = !vm.count("no-handle-interrupt");
-    _task_quota = vm["task-quota-ms"].as<double>() * 1ms;
+    auto task_quota = vm["task-quota-ms"].as<double>() * 1ms;
+    _task_quota = std::chrono::duration_cast<sched_clock::duration>(task_quota);
 
     auto blocked_time = vm["blocked-reactor-notify-ms"].as<unsigned>() * 1ms;
-    _tasks_processed_report_threshold = unsigned(blocked_time / _task_quota);
+    _tasks_processed_report_threshold = unsigned(blocked_time / task_quota);
+    _stall_detector_reports_per_minute = vm["blocked-reactor-reports-per-minute"].as<unsigned>();
 
     _max_task_backlog = vm["max-task-backlog"].as<unsigned>();
     _max_poll_time = vm["idle-poll-time-us"].as<unsigned>() * 1us;
@@ -616,6 +724,7 @@ void reactor::configure(boost::program_options::variables_map vm) {
             || (vm["poll-aio"].defaulted() && vm.count("overprovisioned"))) {
         _aio_eventfd = pollable_fd(file_desc::eventfd(0, 0));
     }
+    set_bypass_fsync(vm["unsafe-bypass-fsync"].as<bool>());
 }
 
 future<> reactor_backend_epoll::get_epoll_future(pollable_fd_state& pfd,
@@ -907,7 +1016,7 @@ io_priority_class io_queue::register_one_priority_class(sstring name, uint32_t s
             io_priority_class p;
             _registered_names[i] = name;
             p.val = i;
-            return std::move(p);
+            return p;
         };
     }
     throw std::runtime_error("No more room for new I/O priority classes");
@@ -1786,8 +1895,6 @@ reactor::touch_directory(sstring name) {
     });
 }
 
-namespace seastar {
-
 file_handle::file_handle(const file_handle& x)
         : _impl(x._impl ? x._impl->clone() : std::unique_ptr<file_handle_impl>()) {
 }
@@ -1810,8 +1917,6 @@ file_handle::to_file() const & {
 file
 file_handle::to_file() && {
     return file(std::move(*_impl).to_file());
-}
-
 }
 
 file::file(seastar::file_handle&& handle)
@@ -1860,7 +1965,7 @@ posix_file_handle_impl::clone() const {
 
 shared_ptr<file_impl>
 posix_file_handle_impl::to_file() && {
-    auto ret = ::make_shared<posix_file_impl>(_fd, _refcount);
+    auto ret = ::seastar::make_shared<posix_file_impl>(_fd, _refcount);
     _fd = -1;
     _refcount = nullptr;
     return ret;
@@ -1869,6 +1974,9 @@ posix_file_handle_impl::to_file() && {
 future<>
 posix_file_impl::flush(void) {
     ++engine()._fsyncs;
+    if (engine()._bypass_fsync) {
+        return make_ready_future<>();
+    }
     return engine()._thread_pool.submit<syscall_result<int>>([this] {
         return wrap_syscall<int>(::fdatasync(_fd));
     }).then([] (syscall_result<int> sr) {
@@ -2213,14 +2321,32 @@ void reactor::exit(int ret) {
     smp::submit_to(0, [this, ret] { _return = ret; stop(); });
 }
 
+uint64_t
+reactor::pending_task_count() const {
+    uint64_t ret = 0;
+    for (auto&& tq : _task_queues) {
+        ret += tq->_q.size();
+    }
+    return ret;
+}
+
+uint64_t
+reactor::tasks_processed() const {
+    uint64_t ret = 0;
+    for (auto&& tq : _task_queues) {
+        ret += tq->_tasks_processed;
+    }
+    return ret;
+}
+
 void reactor::register_metrics() {
 
     namespace sm = seastar::metrics;
 
     _metric_groups.add_group("reactor", {
-            sm::make_gauge("tasks_pending", sm::description("Number of pending tasks in the queue"), std::bind(&decltype(_pending_tasks)::size, &_pending_tasks)),
+            sm::make_gauge("tasks_pending", std::bind(&reactor::pending_task_count, this), sm::description("Number of pending tasks in the queue")),
             // total_operations value:DERIVE:0:U
-            sm::make_derive("tasks_processed", [this] { return _tasks_processed.load(std::memory_order_relaxed); }, sm::description("Total tasks processed")),
+            sm::make_derive("tasks_processed", std::bind(&reactor::tasks_processed, this), sm::description("Total tasks processed")),
             sm::make_derive("polls", [this] { return _polls.load(std::memory_order_relaxed); }, sm::description("Number of times pollers were executed")),
             sm::make_derive("timers_pending", std::bind(&decltype(_timers)::size, &_timers), sm::description("Number of tasks in the timer-pending queue")),
             sm::make_gauge("utilization", [this] { return (1-_load)  * 100; }, sm::description("CPU utilization")),
@@ -2294,9 +2420,10 @@ void reactor::register_metrics() {
     });
 }
 
-void reactor::run_tasks(circular_buffer<std::unique_ptr<task>>& tasks) {
-    STAP_PROBE(seastar, reactor_run_tasks_start);
-    g_need_preempt = false;
+void reactor::run_tasks(task_queue& tq) {
+    // Make sure new tasks will inherit our scheduling group
+    *internal::current_scheduling_group_ptr() = scheduling_group(tq._id);
+    auto& tasks = tq._q;
     while (!tasks.empty()) {
         auto tsk = std::move(tasks.front());
         tasks.pop_front();
@@ -2304,13 +2431,12 @@ void reactor::run_tasks(circular_buffer<std::unique_ptr<task>>& tasks) {
         tsk->run();
         tsk.reset();
         STAP_PROBE(seastar, reactor_run_tasks_single_end);
-        increment_nonatomically(_tasks_processed);
+        ++tq._tasks_processed;
         // check at end of loop, to allow at least one task to run
         if (need_preempt() && tasks.size() <= _max_task_backlog) {
             break;
         }
     }
-    STAP_PROBE(seastar, reactor_run_tasks_end);
 }
 
 void reactor::force_poll() {
@@ -2361,7 +2487,7 @@ void
 manual_clock::advance(manual_clock::duration d) {
     _now.fetch_add(d.count());
     if (local_engine) {
-        schedule_urgent(make_task(&manual_clock::expire_timers));
+        schedule_urgent(make_task(default_scheduling_group(), &manual_clock::expire_timers));
         smp::invoke_on_all(&manual_clock::expire_timers);
     }
 }
@@ -2529,7 +2655,7 @@ class reactor::smp_pollfn final : public reactor::pollfn {
     reactor& _r;
     struct aligned_flag {
         std::atomic<bool> flag;
-        char pad[63];
+        char pad[cache_line_size-sizeof(flag)];
         bool try_lock() {
             return !flag.exchange(true, std::memory_order_relaxed);
         }
@@ -2611,7 +2737,7 @@ public:
 };
 
 
-alignas(64) reactor::smp_pollfn::aligned_flag reactor::smp_pollfn::_membarrier_lock;
+alignas(cache_line_size) reactor::smp_pollfn::aligned_flag reactor::smp_pollfn::_membarrier_lock;
 
 class reactor::epoll_pollfn final : public reactor::pollfn {
     reactor& _r;
@@ -2662,6 +2788,95 @@ void reactor::stop_aio_eventfd_loop() {
     ::write(_aio_eventfd->get_fd(), &one, 8);
 }
 
+inline
+bool
+reactor::have_more_tasks() const {
+    return _active_task_queues.size() + _activating_task_queues.size();
+}
+
+void reactor::insert_active_task_queue(task_queue* tq) {
+    tq->_active = true;
+    auto& atq = _active_task_queues;
+    auto less = task_queue::indirect_compare();
+    if (atq.empty() || less(atq.back(), tq)) {
+        // Common case: idle->working
+        // Common case: CPU intensive task queue going to the back
+        atq.push_back(tq);
+    } else {
+        // Common case: newly activated queue preempting everything else
+        atq.push_front(tq);
+        // Less common case: newly activated queue behind something already active
+        size_t i = 0;
+        while (i + 1 != atq.size() && !less(atq[i], atq[i+1])) {
+            std::swap(atq[i], atq[i+1]);
+            ++i;
+        }
+    }
+}
+
+void
+reactor::insert_activating_task_queues() {
+    // Quadratic, but since we expect the common cases in insert_active_task_queue() to dominate, faster
+    for (auto&& tq : _activating_task_queues) {
+        insert_active_task_queue(tq);
+    }
+    _activating_task_queues.clear();
+}
+
+void
+reactor::run_some_tasks(sched_clock::time_point& t_run_completed) {
+    if (!have_more_tasks()) {
+        return;
+    }
+    sched_print("run_some_tasks: start");
+    g_need_preempt = false;
+    STAP_PROBE(seastar, reactor_run_tasks_start);
+    do {
+        auto t_run_started = t_run_completed;
+        insert_activating_task_queues();
+        auto tq = _active_task_queues.front();
+        _active_task_queues.pop_front();
+        sched_print("running tq {} {}", (void*)tq, tq->_name);
+        tq->_current = true;
+        run_tasks(*tq);
+        tq->_current = false;
+        t_run_completed = std::chrono::steady_clock::now();
+        auto delta = t_run_completed - t_run_started;
+        account_runtime(*tq, delta);
+        _last_vruntime = std::max(tq->_vruntime, _last_vruntime);
+        sched_print("run complete ({} {}); time consumed {} usec; final vruntime {} empty {}",
+                (void*)tq, tq->_name, delta / 1us, tq->_vruntime, tq->_q.empty());
+        if (!tq->_q.empty()) {
+            insert_active_task_queue(tq);
+        } else {
+            tq->_active = false;
+        }
+    } while (have_more_tasks() && !need_preempt());
+    STAP_PROBE(seastar, reactor_run_tasks_end);
+    *internal::current_scheduling_group_ptr() = default_scheduling_group(); // Prevent inheritance from last group run
+    sched_print("run_some_tasks: end");
+}
+
+void
+reactor::activate(task_queue& tq) {
+    if (tq._active) {
+        return;
+    }
+    sched_print("activating {} {}", (void*)&tq, tq._name);
+    // If activate() was called, the task queue is likely network-bound or I/O bound, not CPU-bound. As
+    // such its vruntime will be low, and it will have a large advantage over other task queues. Limit
+    // the advantage so it doesn't dominate scheduling for a long time, in case it _does_ become CPU
+    // bound later.
+    //
+    // FIXME: different scheduling groups have different sensitivity to jitter, take advantage
+    auto advantage = tq.to_vruntime(_task_quota);
+    if (_last_vruntime - advantage > tq._vruntime) {
+        sched_print("tq {} {} losing vruntime {} due to sleep", (void*)&tq, tq._name, _last_vruntime - advantage - tq._vruntime);
+    }
+    tq._vruntime = std::max(_last_vruntime - advantage, tq._vruntime);
+    _activating_task_queues.push_back(&tq);
+}
+
 int reactor::run() {
     auto signal_stack = install_signal_handler_stack();
 
@@ -2670,6 +2885,13 @@ int reactor::run() {
 #ifndef HAVE_OSV
     poller io_poller(std::make_unique<io_pollfn>(*this));
 #endif
+
+    ::sched_param sp;
+    sp.sched_priority = 1;
+    auto sched_ok = pthread_setschedparam(_task_quota_timer_thread.native_handle(), SCHED_FIFO, &sp);
+    if (sched_ok != 0 && _id == 0) {
+        seastar_logger.warn("Unable to set SCHED_FIFO scheduling policy for timer thread; latency impact possible. Try adding CAP_SYS_NICE");
+    }
 
     poller sig_poller(std::make_unique<signal_pollfn>(*this));
     poller aio_poller(std::make_unique<aio_batch_submit_pollfn>(*this));
@@ -2723,10 +2945,10 @@ int reactor::run() {
     using namespace std::chrono_literals;
     timer<lowres_clock> load_timer;
     auto last_idle = _total_idle;
-    auto idle_start = steady_clock_type::now(), idle_end = idle_start;
+    auto idle_start = sched_clock::now(), idle_end = idle_start;
     load_timer.set_callback([this, &last_idle, &idle_start, &idle_end] () mutable {
         _total_idle += idle_end - idle_start;
-        auto load = double((_total_idle - last_idle).count()) / double(std::chrono::duration_cast<steady_clock_type::duration>(1s).count());
+        auto load = double((_total_idle - last_idle).count()) / double(std::chrono::duration_cast<sched_clock::duration>(1s).count());
         last_idle = _total_idle;
         load = std::min(load, 1.0);
         idle_start = idle_end;
@@ -2753,21 +2975,22 @@ int reactor::run() {
     bool idle = false;
 
     std::function<bool()> check_for_work = [this] () {
-        return poll_once() || !_pending_tasks.empty() || seastar::thread::try_run_one_yielded_thread();
+        return poll_once() || have_more_tasks() || seastar::thread::try_run_one_yielded_thread();
     };
     std::function<bool()> pure_check_for_work = [this] () {
-        return pure_poll_once() || !_pending_tasks.empty() || seastar::thread::try_run_one_yielded_thread();
+        return pure_poll_once() || have_more_tasks() || seastar::thread::try_run_one_yielded_thread();
     };
+    auto t_run_completed = idle_end;
     while (true) {
-        run_tasks(_pending_tasks);
+        run_some_tasks(t_run_completed);
         if (_stopped) {
             load_timer.cancel();
             // Final tasks may include sending the last response to cpu 0, so run them
-            while (!_pending_tasks.empty()) {
-                run_tasks(_pending_tasks);
+            while (have_more_tasks()) {
+                run_some_tasks(t_run_completed);
             }
-            while (!_at_destroy_tasks.empty()) {
-                run_tasks(_at_destroy_tasks);
+            while (!_at_destroy_tasks->_q.empty()) {
+                run_tasks(*_at_destroy_tasks);
             }
             smp::arrive_at_event_loop_end();
             if (_id == 0) {
@@ -2781,11 +3004,12 @@ int reactor::run() {
         if (check_for_work()) {
             if (idle) {
                 _total_idle += idle_end - idle_start;
+                account_idle(idle_end - idle_start);
                 idle_start = idle_end;
                 idle = false;
             }
         } else {
-            idle_end = steady_clock_type::now();
+            idle_end = sched_clock::now();
             if (!idle) {
                 idle_start = idle_end;
                 idle = true;
@@ -2801,14 +3025,18 @@ int reactor::run() {
                 report_exception("Exception while running idle cpu handler", std::current_exception());
             }
             if (go_to_sleep) {
+#if defined(__x86_64__) || defined(__i386__)
                 _mm_pause();
+#endif
                 if (idle_end - idle_start > _max_poll_time) {
-                    // Turn off the task quota timer to avoid spurious wakeiups
+                    // Turn off the task quota timer to avoid spurious wakeups
                     struct itimerspec zero_itimerspec = {};
                     _task_quota_timer.timerfd_settime(0, zero_itimerspec);
+                    auto start_sleep = sched_clock::now();
                     sleep();
                     // We may have slept for a while, so freshen idle_end
-                    idle_end = steady_clock_type::now();
+                    idle_end = sched_clock::now();
+                    add_nonatomically(_stall_detector_missed_ticks, uint64_t((start_sleep - idle_end)/_task_quota));
                     _task_quota_timer.timerfd_settime(0, task_quote_itimerspec);
                 }
             } else {
@@ -2816,6 +3044,7 @@ int reactor::run() {
                 // any work.
                 check_for_work();
             }
+            t_run_completed = idle_end;
         }
     }
     // To prevent ordering issues from rising, destroy the I/O queue explicitly at this point.
@@ -3256,9 +3485,13 @@ void schedule_urgent(std::unique_ptr<task> t) {
     engine().add_urgent_task(std::move(t));
 }
 
+}
+
 bool operator==(const ::sockaddr_in a, const ::sockaddr_in b) {
     return (a.sin_addr.s_addr == b.sin_addr.s_addr) && (a.sin_port == b.sin_port);
 }
+
+namespace seastar {
 
 void network_stack_registry::register_stack(sstring name,
         boost::program_options::options_description opts,
@@ -3303,7 +3536,7 @@ network_stack_registrator::network_stack_registrator(sstring name,
 }
 
 boost::program_options::options_description
-reactor::get_options_description() {
+reactor::get_options_description(std::chrono::duration<double> default_task_quota) {
     namespace bpo = boost::program_options;
     bpo::options_description opts("Core options");
     auto net_stack_names = network_stack_registry::list();
@@ -3317,10 +3550,12 @@ reactor::get_options_description() {
                 "idle polling time in microseconds (reduce for overprovisioned environments or laptops)")
         ("poll-aio", bpo::value<bool>()->default_value(true),
                 "busy-poll for disk I/O (reduces latency and increases throughput)")
-        ("task-quota-ms", bpo::value<double>()->default_value(2.0), "Max time (ms) between polls")
+        ("task-quota-ms", bpo::value<double>()->default_value(default_task_quota / 1ms), "Max time (ms) between polls")
         ("max-task-backlog", bpo::value<unsigned>()->default_value(1000), "Maximum number of task backlog to allow; above this we ignore I/O")
         ("blocked-reactor-notify-ms", bpo::value<unsigned>()->default_value(2000), "threshold in miliseconds over which the reactor is considered blocked if no progress is made")
+        ("blocked-reactor-reports-per-minute", bpo::value<unsigned>()->default_value(5), "Maximum number of backtraces reported by stall detector per minute")
         ("relaxed-dma", "allow using buffered I/O if DMA is not available (reduces performance)")
+        ("unsafe-bypass-fsync", bpo::value<bool>()->default_value(false), "Bypass fsync(), may result in data loss. Use for testing on consumer drives")
         ("overprovisioned", "run in an overprovisioned environment (such as docker or a laptop); equivalent to --idle-poll-time-us 0 --thread-affinity 0 --poll-aio 0")
         ("abort-on-seastar-bad-alloc", "abort when seastar allocator cannot allocate memory")
 #ifdef SEASTAR_HEAPPROF
@@ -3349,6 +3584,10 @@ smp::get_options_description()
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of IO queues")
 #else
         ("max-io-requests", bpo::value<unsigned>(), "Maximum amount of concurrent requests to be sent to the disk. Defaults to 128 times the number of processors")
+#endif
+        ("mbind", bpo::value<bool>()->default_value(true), "enable mbind")
+#ifndef NO_EXCEPTION_HACK
+        ("enable-glibc-exception-scaling-workaround", bpo::value<bool>()->default_value(true), "enable workaround for glibc/gcc c++ exception scalablity problem")
 #endif
         ;
     return opts;
@@ -3430,7 +3669,7 @@ void smp::allocate_reactor(unsigned id) {
     // we cannot just write "local_engin = new reactor" since reactor's constructor
     // uses local_engine
     void *buf;
-    int r = posix_memalign(&buf, 64, sizeof(reactor));
+    int r = posix_memalign(&buf, cache_line_size, sizeof(reactor));
     assert(r == 0);
     local_engine = reinterpret_cast<reactor*>(buf);
     new (buf) reactor(id);
@@ -3495,6 +3734,12 @@ static void sigabrt_action() noexcept {
 
 void smp::configure(boost::program_options::variables_map configuration)
 {
+#ifndef NO_EXCEPTION_HACK
+    if (configuration["enable-glibc-exception-scaling-workaround"].as<bool>()) {
+        init_phdr_cache();
+    }
+#endif
+
     // Mask most, to prevent threads (esp. dpdk helper threads)
     // from servicing a signal.  Individual reactors will unmask signals
     // as they become prepared to handle them.
@@ -3521,6 +3766,10 @@ void smp::configure(boost::program_options::variables_map configuration)
     }
     if (!thread_affinity && _using_dpdk) {
         print("warning: --thread-affinity 0 ignored in dpdk mode\n");
+    }
+    auto mbind = configuration["mbind"].as<bool>();
+    if (!thread_affinity) {
+        mbind = false;
     }
 
     smp::count = 1;
@@ -3597,7 +3846,7 @@ void smp::configure(boost::program_options::variables_map configuration)
     if (thread_affinity) {
         smp::pin(allocations[0].cpu_id);
     }
-    memory::configure(allocations[0].mem, hugepages_path);
+    memory::configure(allocations[0].mem, mbind, hugepages_path);
 
     if (configuration.count("abort-on-seastar-bad-alloc")) {
         memory::enable_abort_on_allocation_failure();
@@ -3657,13 +3906,13 @@ void smp::configure(boost::program_options::variables_map configuration)
     unsigned i;
     for (i = 1; i < smp::count; i++) {
         auto allocation = allocations[i];
-        create_thread([configuration, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled] {
+        create_thread([configuration, hugepages_path, i, allocation, assign_io_queue, alloc_io_queue, thread_affinity, heapprof_enabled, mbind] {
             auto thread_name = seastar::format("reactor-{}", i);
             pthread_setname_np(pthread_self(), thread_name.c_str());
             if (thread_affinity) {
                 smp::pin(allocation.cpu_id);
             }
-            memory::configure(allocation.mem, hugepages_path);
+            memory::configure(allocation.mem, mbind, hugepages_path);
             memory::set_heap_profiling_enabled(heapprof_enabled);
             sigset_t mask;
             sigfillset(&mask);
@@ -3712,7 +3961,8 @@ void smp::configure(boost::program_options::variables_map configuration)
     inited.wait();
 
     engine().configure(configuration);
-    engine()._lowres_clock = std::make_unique<lowres_clock>();
+    // The raw `new` is necessary because of the private constructor of `lowres_clock_impl`.
+    engine()._lowres_clock_impl = std::unique_ptr<lowres_clock_impl>(new lowres_clock_impl);
 }
 
 bool smp::poll_queues() {
@@ -3904,34 +4154,6 @@ void engine_exit(std::exception_ptr eptr) {
     engine().exit(1);
 }
 
-saved_backtrace current_backtrace() {
-    std::vector<unw_word_t> v;
-    backtrace([&] (uintptr_t addr) {
-        v.push_back(addr);
-    });
-    return saved_backtrace(std::move(v));
-}
-
-size_t saved_backtrace::hash() const {
-    size_t h = 0;
-    for (auto addr : _frames) {
-        h = ((h << 5) - h) ^ addr;
-    }
-    return h;
-}
-
-std::ostream& operator<<(std::ostream& out, const saved_backtrace& b) {
-    bool first = true;
-    for (auto addr : b._frames) {
-        if (!first) {
-            out << ", ";
-        }
-        out << sprint("0x%x", addr - 1);
-        first = false;
-    }
-    return out;
-}
-
 void report_failed_future(std::exception_ptr eptr) {
     seastar_logger.warn("Exceptional future ignored: {}, backtrace: {}", eptr, current_backtrace());
 }
@@ -4081,7 +4303,7 @@ future<connected_socket> connect(socket_address sa, socket_address local, transp
 }
 
 void reactor::add_high_priority_task(std::unique_ptr<task>&& t) {
-    _pending_tasks.push_front(std::move(t));
+    add_urgent_task(std::move(t));
     // break .then() chains
     g_need_preempt = true;
 }
@@ -4107,7 +4329,7 @@ future<> later() {
     promise<> p;
     auto f = p.get_future();
     engine().force_poll();
-    schedule(make_task([p = std::move(p)] () mutable {
+    schedule(make_task(default_scheduling_group(), [p = std::move(p)] () mutable {
         p.set_value();
     }));
     return f;
@@ -4126,6 +4348,9 @@ network_stack_registrator nsr_posix{"posix",
 };
 
 #ifndef NO_EXCEPTION_INTERCEPT
+
+}
+
 #include <dlfcn.h>
 
 extern "C"
@@ -4138,18 +4363,51 @@ int _Unwind_RaiseException(void *h) {
     if (!org) {
         org = (throw_fn)dlsym (RTLD_NEXT, "_Unwind_RaiseException");
     }
-    if (local_engine) {
-        engine()._cxx_exceptions++;
+    if (seastar::local_engine) {
+        seastar::engine()._cxx_exceptions++;
     }
     return org(h);
 }
 
+namespace seastar {
+
 #endif
 
-steady_clock_type::duration reactor::total_idle_time() {
+reactor::sched_clock::duration reactor::total_idle_time() {
     return _total_idle;
 }
 
-steady_clock_type::duration reactor::total_busy_time() {
-    return steady_clock_type::now() - _start_time - _total_idle;
+reactor::sched_clock::duration reactor::total_busy_time() {
+    return sched_clock::now() - _start_time - _total_idle;
+}
+
+void
+reactor::init_scheduling_group(seastar::scheduling_group sg, sstring name, float shares) {
+    _task_queues.resize(std::max<size_t>(_task_queues.size(), sg._id + 1));
+    _task_queues[sg._id] = std::make_unique<task_queue>(sg._id, name, shares);
+}
+
+const sstring&
+scheduling_group::name() const {
+    return engine()._task_queues[_id]->_name;
+}
+
+void
+scheduling_group::set_shares(float shares) {
+    engine()._task_queues[_id]->set_shares(shares);
+}
+
+future<scheduling_group>
+create_scheduling_group(sstring name, float shares) {
+    static std::atomic<unsigned> last{2}; // 0=main, 1=atexit
+    auto id = last.fetch_add(1);
+    assert(id < max_scheduling_groups());
+    auto sg = scheduling_group(id);
+    return smp::invoke_on_all([sg, name, shares] {
+        engine().init_scheduling_group(sg, name, shares);
+    }).then([sg] {
+        return make_ready_future<scheduling_group>(sg);
+    });
+}
+
 }

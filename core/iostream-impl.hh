@@ -27,6 +27,8 @@
 #include "net/packet.hh"
 #include "core/future-util.hh"
 
+namespace seastar {
+
 inline future<temporary_buffer<char>> data_source_impl::skip(uint64_t n)
 {
     return do_with(uint64_t(n), [this] (uint64_t& n) {
@@ -192,8 +194,8 @@ input_stream<CharType>::read_exactly(size_t n) {
 template <typename CharType>
 template <typename Consumer>
 future<>
-input_stream<CharType>::consume(Consumer& consumer) {
-    return repeat([&consumer, this] {
+input_stream<CharType>::consume(Consumer&& consumer) {
+    return repeat([consumer = std::move(consumer), this] () mutable {
         if (_buf.empty() && !_eof) {
             return _fd.get().then([this] (tmp_buf buf) {
                 _buf = std::move(buf);
@@ -233,6 +235,13 @@ input_stream<CharType>::consume(Consumer& consumer) {
             });
         }
     });
+}
+
+template <typename CharType>
+template <typename Consumer>
+future<>
+input_stream<CharType>::consume(Consumer& consumer) {
+    return consume(std::ref(consumer));
 }
 
 template <typename CharType>
@@ -289,6 +298,16 @@ input_stream<CharType>::skip(uint64_t n) {
     return _fd.skip(n).then([this] (temporary_buffer<CharType> buffer) {
         _buf = std::move(buffer);
     });
+}
+
+template <typename CharType>
+data_source
+input_stream<CharType>::detach() && {
+    if (_buf) {
+        throw std::logic_error("detach() called on a used input_stream");
+    }
+
+    return std::move(_fd);
 }
 
 // Writes @buf in chunks of _size length. The last chunk is buffered if smaller.
@@ -465,4 +484,16 @@ output_stream<CharType>::close() {
     }).finally([this] {
         return _fd.close();
     });
+}
+
+template <typename CharType>
+data_sink
+output_stream<CharType>::detach() && {
+    if (_buf) {
+        throw std::logic_error("detach() called on a used output_stream");
+    }
+
+    return std::move(_fd);
+}
+
 }

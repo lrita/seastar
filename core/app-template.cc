@@ -25,10 +25,14 @@
 #include "core/metrics_api.hh"
 #include <boost/program_options.hpp>
 #include "core/print.hh"
+#include "util/log.hh"
+#include "util/log-cli.hh"
 #include <boost/program_options.hpp>
 #include <boost/make_shared.hpp>
 #include <fstream>
 #include <cstdlib>
+
+namespace seastar {
 
 namespace bpo = boost::program_options;
 
@@ -38,10 +42,15 @@ app_template::app_template(app_template::config cfg)
         _opts.add_options()
                 ("help,h", "show help message")
                 ;
-        _opts.add(reactor::get_options_description());
+        _opts.add(reactor::get_options_description(cfg.default_task_quota));
         _opts.add(seastar::metrics::get_options_description());
         _opts.add(smp::get_options_description());
         _opts.add(scollectd::get_options_description());
+        _opts.add(log_cli::get_options_description());
+}
+
+boost::program_options::options_description& app_template::get_options_description() {
+    return _opts;
 }
 
 boost::program_options::options_description_easy_init
@@ -116,8 +125,21 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
         std::cout << _opts << "\n";
         return 1;
     }
+    if (configuration["help-loggers"].as<bool>()) {
+        log_cli::print_available_loggers(std::cout);
+        return 1;
+    }
 
     bpo::notify(configuration);
+
+    // Needs to be before `smp::configure()`.
+    try {
+        apply_logging_settings(log_cli::extract_settings(configuration));
+    } catch (const std::runtime_error& exn) {
+        std::cout << "logging configuration error: " << exn.what() << '\n';
+        return 1;
+    }
+
     configuration.emplace("argv0", boost::program_options::variable_value(std::string(av[0]), false));
     smp::configure(configuration);
     _configuration = {std::move(configuration)};
@@ -140,4 +162,6 @@ app_template::run_deprecated(int ac, char ** av, std::function<void ()>&& func) 
     auto exit_code = engine().run();
     smp::cleanup();
     return exit_code;
+}
+
 }

@@ -39,6 +39,8 @@
 #include "temporary_buffer.hh"
 #include "scattered_message.hh"
 
+namespace seastar {
+
 namespace net { class packet; }
 
 class data_source_impl {
@@ -142,8 +144,8 @@ public:
     input_stream(input_stream&&) = default;
     input_stream& operator=(input_stream&&) = default;
     future<temporary_buffer<CharType>> read_exactly(size_t n);
-    template <typename Consumer>
-    future<> consume(Consumer& c);
+    template <typename Consumer> future<> consume(Consumer&& c);
+    template <typename Consumer> future<> consume(Consumer& c);
     bool eof() { return _eof; }
     /// Returns some data from the stream, or an empty buffer on end of
     /// stream.
@@ -165,6 +167,19 @@ public:
     }
     /// Ignores n next bytes from the stream.
     future<> skip(uint64_t n);
+
+    /// Detaches the underlying \c data_source from the \c input_stream.
+    ///
+    /// The intended usage is custom \c data_source_impl implementations
+    /// wrapping an existing \c input_stream, therefore it shouldn't be
+    /// called on an \c input_stream that was already used.
+    /// After calling \c detach() the \c input_stream is in an unusable,
+    /// moved-from state.
+    ///
+    /// \throws std::logic_error if called on a used stream
+    ///
+    /// \returns the data_source
+    data_source detach() &&;
 private:
     future<temporary_buffer<CharType>> read_exactly_part(size_t n, tmp_buf buf, size_t completed);
 };
@@ -220,8 +235,23 @@ public:
     future<> write(temporary_buffer<char_type>);
     future<> flush();
     future<> close();
+
+    /// Detaches the underlying \c data_sink from the \c output_stream.
+    ///
+    /// The intended usage is custom \c data_sink_impl implementations
+    /// wrapping an existing \c output_stream, therefore it shouldn't be
+    /// called on an \c output_stream that was already used.
+    /// After calling \c detach() the \c output_stream is in an unusable,
+    /// moved-from state.
+    ///
+    /// \throws std::logic_error if called on a used stream
+    ///
+    /// \returns the data_sink
+    data_sink detach() &&;
 private:
     friend class reactor;
 };
+
+}
 
 #include "iostream-impl.hh"

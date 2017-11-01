@@ -28,7 +28,6 @@
 #include "udp.hh"
 #include "virtio.hh"
 #include "dpdk.hh"
-#include "xenfront.hh"
 #include "proxy.hh"
 #include "dhcp.hh"
 #include <memory>
@@ -41,48 +40,14 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+namespace seastar {
+
 namespace net {
 
 using namespace seastar;
 
-enum class xen_info {
-    nonxen = 0,
-    userspace = 1,
-    osv = 2,
-};
-
-#ifdef HAVE_XEN
-static xen_info is_xen()
-{
-    struct stat buf;
-    if (!stat("/proc/xen", &buf) || !stat("/dev/xen", &buf)) {
-        return xen_info::userspace;
-    }
-
-#ifdef HAVE_OSV
-    const char *str = gnu_get_libc_release();
-    if (std::string("OSv") != str) {
-        return xen_info::nonxen;
-    }
-    auto firmware = osv::firmware_vendor();
-    if (firmware == "Xen") {
-        return xen_info::osv;
-    }
-#endif
-
-    return xen_info::nonxen;
-}
-#endif
-
 void create_native_net_device(boost::program_options::variables_map opts) {
     std::unique_ptr<device> dev;
-
-#ifdef HAVE_XEN
-    auto xen = is_xen();
-    if (xen != xen_info::nonxen) {
-        dev = xen::create_xenfront_net_device(opts, xen == xen_info::userspace);
-    } else
-#endif
 
 #ifdef HAVE_DPDK
     if (opts.count("dpdk-pmd")) {
@@ -173,14 +138,6 @@ native_network_stack::make_udp_channel(ipv4_addr addr) {
 
 void
 add_native_net_options_description(boost::program_options::options_description &opts) {
-
-#ifdef HAVE_XEN
-    auto xen = is_xen();
-    if (xen != xen_info::nonxen) {
-        opts.add(xen::get_xenfront_net_options_description());
-        return;
-    }
-#endif
     opts.add(get_virtio_net_options_description());
 #ifdef HAVE_DPDK
     opts.add(get_dpdk_net_options_description());
@@ -221,12 +178,12 @@ future<> native_network_stack::run_dhcp(bool is_renew, const dhcp::lease& res) {
         auto & ns = static_cast<native_network_stack&>(engine().net());
         ns.set_ipv4_packet_filter(f);
     }).then([this, d = std::move(d), is_renew, res]() mutable {
-        ::net::dhcp::result_type fut = is_renew ? d.renew(res) : d.discover();
+        net::dhcp::result_type fut = is_renew ? d.renew(res) : d.discover();
         return fut.then([this, is_renew](bool success, const dhcp::lease & res) {
             return smp::invoke_on_all([] {
                 auto & ns = static_cast<native_network_stack&>(engine().net());
                 ns.set_ipv4_packet_filter(nullptr);
-            }).then(std::bind(&::net::native_network_stack::on_dhcp, this, success, res, is_renew));
+            }).then(std::bind(&net::native_network_stack::on_dhcp, this, success, res, is_renew));
         }).finally([d = std::move(d)] {});
     });
 }
@@ -334,5 +291,7 @@ boost::program_options::options_description nns_options() {
 network_stack_registrator nns_registrator{
     "native", nns_options(), native_network_stack::create
 };
+
+}
 
 }

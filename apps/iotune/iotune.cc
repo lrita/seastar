@@ -44,9 +44,13 @@
 #include "core/aligned_buffer.hh"
 #include "util/defer.hh"
 
+using namespace seastar;
 using namespace std::chrono_literals;
 
+namespace seastar {
 bool filesystem_has_good_aio_support(sstring directory, bool verbose);
+}
+
 class iotune_manager;
 
 class iotune_timeout_exception : public std::exception {
@@ -784,7 +788,7 @@ int main(int ac, char** av) {
 
     if (!filesystem_has_good_aio_support(directory, false)) {
         std::cerr << "File system on " << directory << " is not qualified for seastar AIO;"
-                " see http://docs.scylladb.com/kb/kb-fs-not-qualified-aio/ for details\n";
+                " see http://www.scylladb.com/2016/02/09/qualifying-filesystems/ for details\n";
         return 1;
     }
     if (fs_check) {

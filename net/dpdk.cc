@@ -81,7 +81,9 @@ void* as_cookie(struct rte_pktmbuf_pool_private& p) {
 typedef void    *MARKER[0];   /**< generic marker for a point in a structure */
 #endif
 
-using namespace net;
+using namespace seastar::net;
+
+namespace seastar {
 
 namespace dpdk {
 
@@ -2247,7 +2249,7 @@ std::unique_ptr<qp> dpdk_device::init_local_queue(boost::program_options::variab
             init_port_fini();
         }
     });
-    return std::move(qp);
+    return qp;
 }
 } // namespace dpdk
 
@@ -2301,6 +2303,8 @@ get_dpdk_net_options_description()
         ;
 #endif
     return opts;
+}
+
 }
 
 #endif // HAVE_DPDK

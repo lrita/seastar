@@ -36,6 +36,8 @@
 #include <boost/algorithm/cxx11/any_of.hpp>
 #include "mock_file.hh"
 
+using namespace seastar;
+
 struct writer {
     output_stream<char> out;
     writer(file f) : out(make_file_output_stream(std::move(f))) {}
@@ -169,7 +171,7 @@ future<> test_consume_until_end(uint64_t size) {
                     BOOST_REQUIRE(std::equal(buf.begin(), buf.end(), expected.begin()));
                     return make_ready_future<input_stream<char>::unconsumed_remainder>(std::experimental::nullopt);
                 };
-                return do_with(make_file_input_stream(f), std::move(consumer), [size] (input_stream<char>& in, auto& consumer) {
+                return do_with(make_file_input_stream(f), std::move(consumer), [] (input_stream<char>& in, auto& consumer) {
                     return in.consume(consumer).then([&in] {
                         return in.close();
                     });

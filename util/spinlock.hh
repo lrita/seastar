@@ -22,7 +22,12 @@
 #pragma once
 
 #include <atomic>
+
+#if defined(__x86_64__) || defined(__i386__)
 #include <xmmintrin.h>
+#endif
+
+namespace seastar {
 
 namespace util {
 
@@ -38,12 +43,16 @@ public:
     ~spinlock() { assert(!_busy.load(std::memory_order_relaxed)); }
     void lock() noexcept {
         while (_busy.exchange(true, std::memory_order_acquire)) {
+#if defined(__x86_64__) || defined(__i386__)
             _mm_pause();
+#endif
         }
     }
     void unlock() noexcept {
         _busy.store(false, std::memory_order_release);
     }
 };
+
+}
 
 }

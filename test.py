@@ -46,6 +46,10 @@ boost_tests = [
     'connect_test',
     'json_formatter_test',
     'execution_stage_test',
+    'lowres_clock_test',
+    'program_options_test',
+    'tuple_utils_test',
+    'noncopyable_function_test',
 ]
 
 other_tests = [
